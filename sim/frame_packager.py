@@ -8,6 +8,8 @@
 #   2/27/21 | Brandon Braun | brandonbraun653@gmail.com
 # **********************************************************************************************************************
 
+from typing import Union
+
 
 class PackedFrame:
     """
@@ -71,22 +73,44 @@ class PackedFrame:
         # Some runtime checks to ensure sizing constraints are met
         assert(len(self.userData) + self.CONTROL_FIELD_SIZE == self.MAX_FRAME_SIZE)
 
-    def write_data(self, data: bytearray):
+    def write_data(self, data: Union[bytearray, bytes]) -> None:
+        """
+        Takes byte level data and places it into the output buffer storage.
+        Args:
+            data: Data to be placed
+
+        Returns:
+            None
+        """
         assert(len(data) <= len(self.userData))
         self.userData[:len(data)] = data
         self.dataLength = len(data)
         self.frameLength = self.dataLength + self.CONTROL_FIELD_SIZE
 
     def read_data(self) -> bytearray:
+        """
+        Reads the packed user data out to the caller
+
+        Returns:
+            User data
+        """
         assert(self.dataLength < len(self.userData))
         return self.userData[:self.dataLength]
 
     def pack(self) -> bytearray:
         """
         Packs the class attributes into a network transferable byte array
+
+        Returns:
+            bytearray of data to be transmitted
         """
         buffer = bytearray(self.MAX_FRAME_SIZE)
         buffer.zfill(self.MAX_FRAME_SIZE)
+
+        # ---------------------------------------------
+        # Pack the user data
+        # ---------------------------------------------
+        buffer[self.CONTROL_FIELD_SIZE:] = self.userData
 
         # ---------------------------------------------
         # Pack the control field
@@ -107,14 +131,14 @@ class PackedFrame:
         endpoint_bytes = (self.endpoint & self.ENDPOINT_MASK) << self.ENDPOINT_OFFSET
         buffer[2] = frame_num_bytes | endpoint_bytes
 
-        # Pack the user data via slicing
-        buffer[self.CONTROL_FIELD_SIZE:] = self.userData
-
         return buffer
 
     def unpack(self, data: bytearray) -> None:
         """
         Unpacks the data into the appropriate class attributes
+
+        Returns:
+            None
         """
         assert(len(data) == self.MAX_FRAME_SIZE)
 
