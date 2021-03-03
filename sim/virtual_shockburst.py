@@ -10,7 +10,7 @@
 
 import time
 import zmq
-from threading import Thread, Rlock
+from threading import Thread, RLock
 from multiprocessing import Queue
 from ipc_utils import gen_ipc_path_for_rx_pipe, gen_ipc_path_for_tx_pipe
 from frame_interface import BaseFrame, RxFifoEntry
@@ -29,9 +29,9 @@ class ShockBurstRadio(Thread):
         self.rxPipe = [self.context.socket(zmq.PULL) for x in range(self.available_rx_pipes())]
 
         self._txQueue = Queue()
-        self._txLock = Rlock()
+        self._txLock = RLock()
         self._rxQueue = Queue()
-        self._rxLock = Rlock()
+        self._rxLock = RLock()
 
     @staticmethod
     def available_tx_pipes():
@@ -122,7 +122,7 @@ class ShockBurstRadio(Thread):
         Returns:
             None
         """
-        with self._rxLock():
+        with self._rxLock:
             for pipe in range(1, 6):
                 # ---------------------------------------------
                 # Any data available?
