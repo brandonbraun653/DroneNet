@@ -19,15 +19,25 @@ from network_frames import *
 
 
 class ShockBurstRadio(Thread):
+    TOPIC_DATA = b'packet'
+    TOPIC_SHOCKBURST = b'shockburst'
 
     def __init__(self):
         super().__init__()
         self.mac_address = 0
 
+        # ---------------------------------------------------------------------
+        # Create pub/sub sockets for all pipes. Only pipe 0 is used for actual
+        # data transmission. Pipes 1-5 are used to mimic ShockBurst functions
+        # like auto-ack or ack-payloads without getting in the way of pipe 0.
+        # ---------------------------------------------------------------------
         self.context = zmq.Context()
-        self.txPipe = self.context.socket(zmq.PUB)
-        self.rxPipe = [self.context.socket(zmq.SUB) for x in range(self.available_rx_pipes())]
+        self.txPipe = [self.context.socket(zmq.PUSH) for x in range(self.total_pipes())]
+        self.rxPipe = [self.context.socket(zmq.PULL) for x in range(self.total_pipes())]
 
+        # ---------------------------------------------
+        # Internal multi-threading utilities
+        # ---------------------------------------------
         self._txQueue = Queue()
         self._txLock = RLock()
         self._rxQueue = Queue()
@@ -42,6 +52,10 @@ class ShockBurstRadio(Thread):
     def available_rx_pipes():
         return 6
 
+    @staticmethod
+    def total_pipes():
+        return 6
+
     def kill(self) -> None:
         self._kill_switch.set()
 
@@ -52,29 +66,27 @@ class ShockBurstRadio(Thread):
 
         Args:
             dst_mac: Address to open the pipe to
-            pipe: Which pipe to write to
+            pipe: Which pipe to write to on the destination. Should be 1-5.
         """
         # ---------------------------------------------------------------------
-        # Open RX pipe 0 to receive messages. This is accomplished by listening
-        # to a TX endpoint that another node has/will open(ed). It's inverted
-        # from the ShockBurst described in the datasheets, due to how ZeroMQ
-        # works with PUSH/PULL sockets. The RX socket doesn't sit with an open
-        # port waiting for data. It must pull directly from a node that TXs it.
+        # Figure out the address of the RX pipe on the destination device, then
+        # instruct Pipe 0 publisher to open a connection to it. If that RX pipe
+        # exists, it will have attempted to connect to the publisher already.
         # ---------------------------------------------------------------------
-        rx_ipc_path = gen_ipc_path_for_rx_pipe(dst_mac, 0)
-        rx_url = "ipc://" + str(rx_ipc_path)
-        self.rxPipe[0].connect(rx_url)
-        print("RX pipe 0 listening to {}".format(rx_url))
+        tx_ipc_path = gen_ipc_path_for_rx_pipe(dst_mac, pipe)
+        tx_url = "ipc://" + str(tx_ipc_path)
+        self.txPipe[0].connect(tx_url)
+        print("TX pipe 0 bound to device {} pipe {}. IPC address: {}".format(hex(dst_mac), pipe, tx_url))
 
         # ---------------------------------------------------------------------
-        # Like the RX port, this is inverted too. Generate a TX port for the
-        # destination node that it expects to find for a given pipe address,
-        # that way it can connect and pull data from it.
+        # Set up pipe 0 RX socket to subscribe to messages from the destination
+        # device's pipe <x> TX socket. This will allow us to receive ShockBurst
+        # messages in reply should they be needed.
         # ---------------------------------------------------------------------
-        tx_ipc_path = gen_ipc_path_for_tx_pipe(dst_mac, pipe)
-        tx_url = "ipc://" + str(tx_ipc_path)
-        self.txPipe.bind(tx_url)
-        print("TX pipe writing to {}".format(tx_url))
+        rx_ipc_path = gen_ipc_path_for_tx_pipe(dst_mac, pipe)
+        rx_url = "ipc://" + str(rx_ipc_path)
+        self.rxPipe[0].bind(rx_url)
+        print("RX pipe 0 listen to device {} pipe {}. IPC address: {}".format(hex(dst_mac), pipe, rx_url))
 
     def set_device_mac(self, mac: int) -> None:
         """
@@ -89,13 +101,17 @@ class ShockBurstRadio(Thread):
         Args:
             mac: Root MAC address
         """
-        rx_ipc_paths = [gen_ipc_path_for_rx_pipe(mac, x+1) for x in range(5)]
+        rx_ipc_paths = [gen_ipc_path_for_rx_pipe(mac, x) for x in range(self.total_pipes())]
 
-        idx = 1
+        idx = 0
         for path in rx_ipc_paths:
-            url = "ipc://" + str(path)
-            self.rxPipe[idx].bind(url)
-            print("RX pipe {} connected to {}".format(idx, url))
+            # url = "ipc://" + str(path)
+            url = "tcp://127.0.0.1:1234"
+            self.rxPipe[idx].connect(url)
+            # self.rxPipe[idx].set(zmq.SUBSCRIBE, b'')
+            #self.rxPipe[idx].set(zmq.SUBSCRIBE, self.TOPIC_DATA)
+            #self.rxPipe[idx].set(zmq.SUBSCRIBE, self.TOPIC_SHOCKBURST)
+            print("RX pipe {} on device {} is listening on {}".format(idx, hex(mac), url))
             idx += 1
 
     def transmit(self, data: bytearray) -> None:
@@ -110,8 +126,9 @@ class ShockBurstRadio(Thread):
         """
         Main message pump that acts as the hardware transceiver in the NRF24L01
         """
-        process_period = 0.025
+        process_period = 0.1
         print("Starting ShockBurst processing")
+        time.sleep(0.5)
 
         while not self._kill_switch.is_set():
             # Pump messages through the "transceiver"
@@ -128,7 +145,8 @@ class ShockBurstRadio(Thread):
             None
         """
         with self._rxLock:
-            for pipe in range(1, self.available_rx_pipes()):
+
+            for pipe in range(self.available_rx_pipes()):
                 # ---------------------------------------------
                 # Any data available?
                 # ---------------------------------------------
@@ -145,6 +163,8 @@ class ShockBurstRadio(Thread):
                 frame = PackedFrame()
                 frame.unpack(data)
                 self._rxQueue.put(RxFifoEntry(pipe, frame))
+
+                # Will need to reconfigure the TX pipe for sending back to the source node
 
                 # ---------------------------------------------
                 # If required, transmit an ACK
