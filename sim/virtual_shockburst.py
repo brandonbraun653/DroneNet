@@ -10,12 +10,23 @@
 
 import time
 import zmq
+import shockburst_pb2
+
+from enum import Enum
 from threading import Thread, RLock, Event
 from multiprocessing import Queue
-from ipc_utils import gen_ipc_path_for_rx_pipe, gen_ipc_path_for_tx_pipe
+from ipc_utils import gen_ipc_path, gen_ipc_path_for_tx_pipe
 from frame_interface import BaseFrame, RxFifoEntry
 from frame_packager import PackedFrame
 from network_frames import *
+
+
+class FrameType(Enum):
+    """ Type of ShockBurst frames that may be sent. Must match with C++ definition. """
+    INVALID = 0
+    ACK_FRAME = 1
+    NACK_FRAME = 2
+    USER_DATA = 3
 
 
 class ShockBurstRadio(Thread):
@@ -32,8 +43,8 @@ class ShockBurstRadio(Thread):
         # like auto-ack or ack-payloads without getting in the way of pipe 0.
         # ---------------------------------------------------------------------
         self.context = zmq.Context()
-        self.txPipe = [self.context.socket(zmq.PUSH) for x in range(self.total_pipes())]
-        self.rxPipe = [self.context.socket(zmq.PULL) for x in range(self.total_pipes())]
+        self.txPipe = [self.context.socket(zmq.PUB) for x in range(self.total_pipes())]
+        self.rxPipe = [self.context.socket(zmq.SUB) for x in range(self.total_pipes())]
 
         # ---------------------------------------------
         # Internal multi-threading utilities
@@ -73,19 +84,19 @@ class ShockBurstRadio(Thread):
         # instruct Pipe 0 publisher to open a connection to it. If that RX pipe
         # exists, it will have attempted to connect to the publisher already.
         # ---------------------------------------------------------------------
-        tx_ipc_path = gen_ipc_path_for_rx_pipe(dst_mac, pipe)
+        tx_ipc_path = gen_ipc_path(dst_mac, pipe)
         tx_url = "ipc://" + str(tx_ipc_path)
         self.txPipe[0].connect(tx_url)
-        print("TX pipe 0 bound to device {} pipe {}. IPC address: {}".format(hex(dst_mac), pipe, tx_url))
+        print("TX pipe 0 connected to device {} pipe {}. IPC address: {}".format(hex(dst_mac), pipe, tx_url))
 
         # ---------------------------------------------------------------------
         # Set up pipe 0 RX socket to subscribe to messages from the destination
         # device's pipe <x> TX socket. This will allow us to receive ShockBurst
         # messages in reply should they be needed.
         # ---------------------------------------------------------------------
-        rx_ipc_path = gen_ipc_path_for_tx_pipe(dst_mac, pipe)
+        rx_ipc_path = gen_ipc_path(dst_mac, pipe)
         rx_url = "ipc://" + str(rx_ipc_path)
-        self.rxPipe[0].bind(rx_url)
+        self.rxPipe[0].connect(rx_url)
         print("RX pipe 0 listen to device {} pipe {}. IPC address: {}".format(hex(dst_mac), pipe, rx_url))
 
     def set_device_mac(self, mac: int) -> None:
@@ -101,14 +112,13 @@ class ShockBurstRadio(Thread):
         Args:
             mac: Root MAC address
         """
-        rx_ipc_paths = [gen_ipc_path_for_rx_pipe(mac, x) for x in range(self.total_pipes())]
+        rx_ipc_paths = [gen_ipc_path(mac, x) for x in range(self.total_pipes())]
 
         idx = 0
         for path in rx_ipc_paths:
-            # url = "ipc://" + str(path)
-            url = "tcp://127.0.0.1:1234"
+            url = "ipc://" + str(path)
             self.rxPipe[idx].connect(url)
-            # self.rxPipe[idx].set(zmq.SUBSCRIBE, b'')
+            self.rxPipe[idx].set(zmq.SUBSCRIBE, b'')
             #self.rxPipe[idx].set(zmq.SUBSCRIBE, self.TOPIC_DATA)
             #self.rxPipe[idx].set(zmq.SUBSCRIBE, self.TOPIC_SHOCKBURST)
             print("RX pipe {} on device {} is listening on {}".format(idx, hex(mac), url))
@@ -146,7 +156,7 @@ class ShockBurstRadio(Thread):
         """
         with self._rxLock:
 
-            for pipe in range(self.available_rx_pipes()):
+            for pipe in range(len(self.rxPipe)):
                 # ---------------------------------------------
                 # Any data available?
                 # ---------------------------------------------
@@ -157,20 +167,28 @@ class ShockBurstRadio(Thread):
                 except zmq.Again:
                     continue
 
+                pb_frame = shockburst_pb2.ShockBurstFrame()
+                pb_frame.ParseFromString(data)
+
                 # ---------------------------------------------
                 # Enqueue the RX'd frame
                 # ---------------------------------------------
                 frame = PackedFrame()
-                frame.unpack(data)
+                frame.unpack(pb_frame.data)
                 self._rxQueue.put(RxFifoEntry(pipe, frame))
-
-                # Will need to reconfigure the TX pipe for sending back to the source node
 
                 # ---------------------------------------------
                 # If required, transmit an ACK
                 # ---------------------------------------------
                 if frame.requireAck:
-                    self.txPipe.send(ACKFrame().to_bytes())
+                    ack_frame = shockburst_pb2.ShockBurstFrame()
+                    ack_frame.sender = "abcd"
+                    ack_frame.crc = 0
+                    ack_frame.type = FrameType.ACK_FRAME
+                    ack_frame.frame_id = pb_frame.frame_id
+
+                    # Need to open a TX pipe to the destination. Pipe registry!!!
+                    self.txPipe[pipe].send(pb_frame.SerializeToString())
 
     def _dequeue_tx_pipes(self) -> None:
         """

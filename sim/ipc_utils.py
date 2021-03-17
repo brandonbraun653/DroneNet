@@ -33,7 +33,7 @@ def _gen_ipc_path(path, base_mac, pipe) -> Path:
     return ipc_path
 
 
-def gen_ipc_path_for_rx_pipe(base_mac, pipe) -> Path:
+def gen_ipc_path(base_mac, pipe) -> Path:
     """
     Builds a path that should represent some RX pipe
     """
